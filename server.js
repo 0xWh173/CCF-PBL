@@ -1,8 +1,143 @@
-const express = require('express');
 const http = require('http');
-const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const EventEmitter = require('events');
+const geminiService = require('./geminiService');
+
+let express, WebSocket;
+try {
+    express = require('express');
+    WebSocket = require('ws');
+} catch (e) {
+    // Zero-dependency fallback shims
+    express = function() {
+        const routes = { GET: [], POST: [] };
+        let staticDir = null;
+
+        const app = function(req, res) {
+            res.json = function(data) {
+                res.setHeader('Content-Type', 'application/json');
+                res.end(JSON.stringify(data));
+            };
+            res.status = function(code) {
+                res.statusCode = code;
+                return res;
+            };
+
+            let bodyData = '';
+            req.on('data', chunk => bodyData += chunk);
+            req.on('end', () => {
+                try {
+                    req.body = bodyData ? JSON.parse(bodyData) : {};
+                } catch (err) {
+                    req.body = {};
+                }
+
+                const urlPath = req.url.split('?')[0];
+                const routeList = routes[req.method] || [];
+                const matched = routeList.find(r => r.path === urlPath);
+                if (matched) {
+                    return matched.handler(req, res);
+                }
+
+                if (req.method === 'GET' && staticDir) {
+                    let relativePath = urlPath === '/' ? '/index.html' : urlPath;
+                    let safePath = path.normalize(relativePath).replace(/^(\.\.[\/\\])+/, '');
+                    let filePath = path.join(staticDir, safePath);
+
+                    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+                        const ext = path.extname(filePath).toLowerCase();
+                        const mimeTypes = {
+                            '.html': 'text/html',
+                            '.css': 'text/css',
+                            '.js': 'application/javascript',
+                            '.json': 'application/json',
+                            '.png': 'image/png',
+                            '.jpg': 'image/jpeg',
+                            '.svg': 'image/svg+xml'
+                        };
+                        res.setHeader('Content-Type', mimeTypes[ext] || 'application/octet-stream');
+                        return fs.createReadStream(filePath).pipe(res);
+                    }
+                }
+
+                res.statusCode = 404;
+                res.end('404 Not Found');
+            });
+        };
+
+        app.use = function(middleware) {
+            if (typeof middleware === 'function' && middleware.staticDir) {
+                staticDir = middleware.staticDir;
+            }
+        };
+        app.post = function(path, handler) { routes.POST.push({ path, handler }); };
+        app.get = function(path, handler) { routes.GET.push({ path, handler }); };
+
+        return app;
+    };
+    express.json = function() { return function() {}; };
+    express.static = function(dir) {
+        const fn = function() {};
+        fn.staticDir = dir;
+        return fn;
+    };
+
+    class MiniWSClient extends EventEmitter {
+        constructor(socket) {
+            super();
+            this.socket = socket;
+            this.readyState = 1;
+            socket.on('close', () => { this.readyState = 3; this.emit('close'); });
+            socket.on('error', () => { this.readyState = 3; this.emit('close'); });
+        }
+        send(data) {
+            if (this.readyState !== 1) return;
+            const payload = Buffer.from(data);
+            const len = payload.length;
+            let header;
+            if (len <= 125) {
+                header = Buffer.from([0x81, len]);
+            } else if (len <= 65535) {
+                header = Buffer.alloc(4);
+                header[0] = 0x81; header[1] = 126; header.writeUInt16BE(len, 2);
+            } else {
+                header = Buffer.alloc(10);
+                header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2);
+            }
+            try { this.socket.write(Buffer.concat([header, payload])); } catch (e) { this.readyState = 3; }
+        }
+    }
+
+    class MiniWSServer extends EventEmitter {
+        constructor() {
+            super();
+            this.clients = new Set();
+        }
+        handleUpgrade(request, socket, head, callback) {
+            const key = request.headers['sec-websocket-key'];
+            if (!key) { socket.destroy(); return; }
+            const acceptKey = crypto.createHash('sha1')
+                .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
+                .digest('base64');
+            const headers = [
+                'HTTP/1.1 101 Switching Protocols',
+                'Upgrade: websocket',
+                'Connection: Upgrade',
+                `Sec-WebSocket-Accept: ${acceptKey}`,
+                '\r\n'
+            ];
+            socket.write(headers.join('\r\n'));
+            const client = new MiniWSClient(socket);
+            this.clients.add(client);
+            client.on('close', () => this.clients.delete(client));
+            callback(client);
+        }
+    }
+
+    WebSocket = { OPEN: 1, Server: MiniWSServer };
+}
 
 const app = express();
 const server = http.createServer(app);
@@ -15,82 +150,22 @@ const LOG_FILE = path.join(__dirname, 'soc_audit_trail.log');
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Global State
+// Global State - Initialized cleanly with baseline telemetry (No mock data)
 let socState = {
-    threatLevel: 42.8,
-    ingressRate: 4.82,
-    mitigationRate: 94.2,
-    activeAlerts: [
-        {
-            id: "INC-8042",
-            title: "Malicious User Agent (SQL Injection)",
-            severity: "critical",
-            score: "9.2",
-            sourceIp: "198.51.100.89",
-            target: "VM-PAYMENTS-03",
-            time: "Just Now",
-            payload: `POST /api/v1/checkout HTTP/1.1\nHost: secure-pay.internal.local\nUser-Agent: sqlmap/1.4.12#stable (http://sqlmap.org)\nAccept: */*\nContent-Length: 104\n\nid=5' OR 1=1; DROP TABLE Transactions; --&verify=true`,
-            recommendation: "SQL Injection attack detected via SQLMap User-Agent headers. Automated recommendation: deploy immediate Web Application Firewall (WAF) payload rules on VM-PAYMENTS-03 and block attacker source IP address."
-        },
-        {
-            id: "INC-7911",
-            title: "DDoS Reflection Attack (SSDP)",
-            severity: "high",
-            score: "8.5",
-            sourceIp: "203.0.113.14",
-            target: "API-GATEWAY",
-            time: "2 mins ago",
-            payload: `UDP 203.0.113.14:1900 -> 10.142.0.10:80\nLength: 1024 bytes\nType: SSDP Search Response Reflection\nAlert Threshold Exceeded: > 140,000 requests/sec`,
-            recommendation: "SSDP Reflection flooding API-GATEWAY. Recommended action: Enable Cloudflare/Edge rate-limiting thresholds and execute DDoS protection null-routing rules on edge router API-RT-01."
-        },
-        {
-            id: "INC-7804",
-            title: "Brute Force SSH Attack",
-            severity: "high",
-            score: "7.8",
-            sourceIp: "185.190.140.22",
-            target: "AUTH-SERVICE",
-            time: "10 mins ago",
-            payload: `Aug  5 08:42:01 auth-srv sshd[28104]: Failed password for root from 185.190.140.22 port 49210 ssh2\nAug  5 08:42:04 auth-srv sshd[28104]: Failed password for root from 185.190.140.22 port 49214 ssh2\nAug  5 08:42:06 auth-srv sshd[28104]: Repeated 42 times`,
-            recommendation: "Continuous failed SSH root authentication attempts on AUTH-SERVICE. Recommendation: trigger fail2ban isolation, block attacker IP temporarily, and enforce SSH Key Auth only."
-        },
-        {
-            id: "INC-7501",
-            title: "Data Exfiltration (Anomalous Outbound)",
-            severity: "medium",
-            score: "5.4",
-            sourceIp: "10.142.45.92",
-            target: "DEV-STAGE-01",
-            time: "24 mins ago",
-            payload: `OUTBOUND connection from 10.142.45.92:5432 -> external-ftp-backup.ru:21\nVolume: 1.4 GB sent in 24 seconds\nBaseline Exceeded: +1200%`,
-            recommendation: "Internal server DEV-STAGE-01 transferring excessive volumes to an unverified external endpoint. Recommend isolating the staging server virtual machine and auditing database client permissions."
-        },
-        {
-            id: "INC-7102",
-            title: "Local Privilege Escalation attempt",
-            severity: "low",
-            score: "3.2",
-            sourceIp: "10.142.45.101",
-            target: "WEB-CLUSTER-01",
-            time: "48 mins ago",
-            payload: `user@web-srv-01:~$ sudo -l\nuser@web-srv-01:~$ ./dirtycow\n[+] Exploit initialized. Accessing kernel space...`,
-            recommendation: "Unprivileged user attempting exploit pattern match on WEB-CLUSTER-01. Recommendation: Apply latest Linux security kernel patches to web nodes."
-        }
-    ],
-    auditTrail: [
-        { id: "MIT-901", target: "VM-PAYMENTS-03", desc: "SQL injection payload blocked", source: "AI Autopilot", actions: "WAF Rule 409 Activated", status: "Mitigated" },
-        { id: "MIT-899", target: "EDGE-ROUTER-01", desc: "DDoS flow null-routed", source: "AI Autopilot", actions: "IP 203.0.113.14 blocked", status: "Mitigated" },
-        { id: "MIT-884", target: "AUTH-SERVICE", desc: "SSH Brute force containment", source: "Operator Admin", actions: "Fail2ban trigger IP block", status: "Mitigated" }
-    ],
+    threatLevel: 10.0,
+    ingressRate: 1.50,
+    mitigationRate: 100.0,
+    activeAlerts: [],
+    auditTrail: [],
     networkNodes: [
-        { name: "DB-PROD-01", ip: "10.142.45.189", risk: 85, status: "active", metrics: "CPU: 92% | SQL load high", rawCpu: 92 },
-        { name: "WEB-CLUSTER-01", ip: "10.142.45.101", risk: 15, status: "safe", metrics: "CPU: 24% | Normal", rawCpu: 24 },
+        { name: "DB-PROD-01", ip: "10.142.45.189", risk: 10, status: "safe", metrics: "CPU: 15% | Operational Safe", rawCpu: 15 },
+        { name: "WEB-CLUSTER-01", ip: "10.142.45.101", risk: 10, status: "safe", metrics: "CPU: 18% | Normal", rawCpu: 18 },
         { name: "AUTH-SERVICE", ip: "10.142.45.12", risk: 10, status: "safe", metrics: "CPU: 12% | Normal", rawCpu: 12 },
-        { name: "API-GATEWAY", ip: "10.142.0.10", risk: 65, status: "active", metrics: "CPU: 68% | Ingress 2.1 GB/s", rawCpu: 68 },
-        { name: "DEV-STAGE-01", ip: "10.142.45.92", risk: 45, status: "active", metrics: "CPU: 8% | SFTP session active", rawCpu: 8 },
-        { name: "VM-PAYMENTS-03", ip: "10.142.90.4", risk: 92, status: "active", metrics: "CPU: 97% | Suspicious logs", rawCpu: 97 }
+        { name: "API-GATEWAY", ip: "10.142.0.10", risk: 10, status: "safe", metrics: "CPU: 16% | Ingress Normal", rawCpu: 16 },
+        { name: "DEV-STAGE-01", ip: "10.142.45.92", risk: 10, status: "safe", metrics: "CPU: 10% | Normal", rawCpu: 10 },
+        { name: "VM-PAYMENTS-03", ip: "10.142.90.4", risk: 10, status: "safe", metrics: "CPU: 14% | Operational Safe", rawCpu: 14 }
     ],
-    autopilotBannerActive: true
+    autopilotBannerActive: false
 };
 
 // Helper: Append entries to local physical log file & stream live over WebSocket
@@ -106,7 +181,7 @@ function broadcastLog(logObj) {
 function logAuditEvent(target, desc, source, actions, status) {
     const timestamp = new Date().toISOString();
     const logObj = { timestamp, target, desc, source, actions, status };
-    
+
     fs.appendFile(LOG_FILE, JSON.stringify(logObj) + '\n', (err) => {
         if (err) console.error("Error writing to audit log:", err);
     });
@@ -132,13 +207,13 @@ function broadcastState() {
 app.post('/api/mitigate', (req, res) => {
     const { alertId } = req.body;
     const alertIndex = socState.activeAlerts.findIndex(a => a.id === alertId);
-    
+
     if (alertIndex !== -1) {
         const alert = socState.activeAlerts[alertIndex];
-        
+
         const mitId = `MIT-${Math.floor(Math.random() * 900) + 100}`;
         const actions = `Secured target ${alert.target} & blocked source IP ${alert.sourceIp}`;
-        
+
         socState.auditTrail.unshift({
             id: mitId,
             target: alert.target,
@@ -167,10 +242,10 @@ app.post('/api/mitigate', (req, res) => {
 
         // Remove alert
         socState.activeAlerts.splice(alertIndex, 1);
-        
+
         // Adjust metrics
         socState.threatLevel = Math.max(12.4, parseFloat((socState.threatLevel - 7.5).toFixed(1)));
-        
+
         broadcastState();
         res.json({ success: true, state: socState });
     } else {
@@ -182,13 +257,13 @@ app.post('/api/mitigate', (req, res) => {
 app.post('/api/isolate', (req, res) => {
     const { nodeName } = req.body;
     const node = socState.networkNodes.find(n => n.name === nodeName);
-    
+
     if (node) {
         node.status = "isolated";
         node.metrics = "OFFLINE - ISOLATED BY OPERATOR";
         node.rawCpu = 0;
         node.risk = 0;
-        
+
         const actions = `Isolated host subnet gateway IP ${node.ip}`;
         socState.auditTrail.unshift({
             id: `MIT-${Math.floor(Math.random() * 900) + 100}`,
@@ -203,7 +278,7 @@ app.post('/api/isolate', (req, res) => {
         setTimeout(() => {
             logAuditEvent(node.name, `CONTAINMENT ACTIVE: Node ${node.name} disconnected from gateway routing`, "Cluster Firewall", "Host Offline", "Mitigated");
         }, 150);
-        
+
         broadcastState();
         res.json({ success: true, state: socState });
     } else {
@@ -215,7 +290,7 @@ app.post('/api/isolate', (req, res) => {
 app.post('/api/reconnect', (req, res) => {
     const { nodeName } = req.body;
     const node = socState.networkNodes.find(n => n.name === nodeName);
-    
+
     if (node) {
         node.status = "safe";
         node.risk = 10;
@@ -233,7 +308,7 @@ app.post('/api/reconnect', (req, res) => {
         });
 
         logAuditEvent(node.name, `INTERFACE RESTORED: Host Subnet Gateway IP ${node.ip} re-enabled`, "Operator Admin", actions, "ONLINE");
-        
+
         broadcastState();
         res.json({ success: true, state: socState });
     } else {
@@ -342,7 +417,7 @@ app.post('/api/chat', (req, res) => {
 // 6. Manual Attack Simulation Endpoint
 app.post('/api/simulate-attack', (req, res) => {
     const { title, severity, score, targetNode, sourceIp, payload, recommendation } = req.body;
-    
+
     let target = targetNode;
     if (!target) {
         const activeNodes = socState.networkNodes.filter(n => n.status !== 'isolated');
@@ -367,10 +442,10 @@ app.post('/api/simulate-attack', (req, res) => {
     };
 
     socState.activeAlerts.unshift(newAlert);
-    
+
     const attackScore = parseFloat(newAlert.score);
     socState.threatLevel = Math.min(100.0, parseFloat((socState.threatLevel + attackScore / 2).toFixed(1)));
-    
+
     if (selectedNode && selectedNode.status !== 'isolated') {
         selectedNode.risk = Math.min(99, selectedNode.risk + 35);
         selectedNode.rawCpu = Math.min(99, selectedNode.rawCpu + 45);
@@ -379,7 +454,7 @@ app.post('/api/simulate-attack', (req, res) => {
 
     // Multi-phase attack simulation logging over WebSockets
     logAuditEvent(target, `PACKET INGRESS: TCP ${randomIp}:49152 -> ${selectedNode ? selectedNode.ip : '10.142.0.1'}:80 (SYN)`, "Perimeter Gateway API-RT-01", "Packet Inspection Active", "Telemetry Stream");
-    
+
     setTimeout(() => {
         logAuditEvent(target, `SECURITY THREAT MATCH: ${newAlert.title}`, "Signature Detection Engine", `Source IP: ${randomIp}`, "Active Threat");
     }, 150);
@@ -417,8 +492,8 @@ app.post('/api/reset', (req, res) => {
     res.json({ success: true, state: socState });
 });
 
-// Dynamic Threat Simulation Speed Config
-let simulationMode = "normal"; // "fast", "normal", "paused"
+// Dynamic Threat Simulation Speed Config (Paused by default so threats occur ONLY via Attack Simulator)
+let simulationMode = "paused"; // "fast", "normal", "paused"
 let threatTimer = null;
 
 function getIntervalForMode(mode) {
@@ -486,7 +561,7 @@ function spawnBackgroundThreat() {
 
     socState.activeAlerts.unshift(newAlert);
     socState.threatLevel = Math.min(100.0, parseFloat((socState.threatLevel + parseFloat(template.score) / 2).toFixed(1)));
-    
+
     logAuditEvent(selectedTarget.name, `Threat Detected: ${template.title}`, "Threat Intelligence Engine", `Source IP: ${randomIp}`, "Active Threat");
 
     selectedTarget.risk = Math.min(98, selectedTarget.risk + 15);
@@ -512,35 +587,32 @@ app.post('/api/simulation-config', (req, res) => {
     res.status(400).json({ success: false, error: "Invalid mode" });
 });
 
-// Periodic Telemetry updates simulator (Fluctuates CPU and Ingress Rate every 800ms sub-second)
+// Periodic Telemetry updates simulator (Reflects REAL node status & load)
 setInterval(() => {
     socState.networkNodes.forEach(node => {
         if (node.status !== "isolated") {
-            const fluctuation = Math.floor(Math.random() * 7) - 3;
-            node.rawCpu = Math.min(99, Math.max(5, node.rawCpu + fluctuation));
-            
-            if (node.name === "API-GATEWAY") {
-                node.metrics = `CPU: ${node.rawCpu}% | Ingress ${(socState.ingressRate).toFixed(2)} GB/s`;
-            } else if (node.name === "DEV-STAGE-01") {
-                node.metrics = `CPU: ${node.rawCpu}% | SFTP session active`;
-            } else if (node.name === "DB-PROD-01" && node.rawCpu > 80) {
-                node.metrics = `CPU: ${node.rawCpu}% | SQL load high`;
+            const nodeAlerts = socState.activeAlerts.filter(a => a.target === node.name);
+            if (nodeAlerts.length > 0) {
+                // Node is under active attack
+                node.rawCpu = Math.min(99, Math.max(75, node.rawCpu + (Math.floor(Math.random() * 5) - 2)));
+                node.risk = Math.min(99, Math.max(60, node.risk));
+                node.metrics = `CPU: ${node.rawCpu}% | UNDER ATTACK (${nodeAlerts[0].title})`;
             } else {
-                node.metrics = `CPU: ${node.rawCpu}% | ${node.rawCpu > 50 ? 'Medium Load' : 'Normal'}`;
+                // Node is operating normally
+                node.rawCpu = Math.min(30, Math.max(8, node.rawCpu + (Math.floor(Math.random() * 3) - 1)));
+                node.risk = Math.max(5, Math.min(15, node.risk - 2));
+                node.metrics = `CPU: ${node.rawCpu}% | Operational Safe`;
             }
         }
     });
 
-    const flowFluctuation = (Math.random() * 0.4) - 0.2;
-    socState.ingressRate = Math.min(10.0, Math.max(1.1, socState.ingressRate + flowFluctuation));
-    
-    const mitFluctuation = (Math.random() * 0.2) - 0.1;
-    socState.mitigationRate = Math.min(99.9, Math.max(75.0, socState.mitigationRate + mitFluctuation));
+    const flowFluctuation = (Math.random() * 0.1) - 0.05;
+    socState.ingressRate = Math.min(10.0, Math.max(1.0, socState.ingressRate + flowFluctuation));
 
     broadcastState();
-}, 800);
+}, 1000);
 
-// Start background auto threat generator
+// Start background threat generator (Paused by default)
 resetThreatTimer();
 
 // WebSocket Setup
@@ -552,7 +624,7 @@ server.on('upgrade', (request, socket, head) => {
 
 wss.on('connection', (ws) => {
     console.log("Client connected to SOC WebSocket gateway");
-    
+
     // Send initial complete state upon connecting
     ws.send(JSON.stringify({
         type: "INITIAL_STATE",

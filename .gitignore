@@ -1,2 +1,25 @@
+# Dependencies
 node_modules/
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+*.env
+*.pem
+*.key
+*.cert
+
+# Log files & audit trails
+*.log
+soc_audit_trail.log
+
+# Temporary & automation scripts / output folders
+screenshots/
+screenshorts/
+capture_screenshots.py
+
+# Agent & System / IDE files
 .agents
+.DS_Store
+Thumbs.db
